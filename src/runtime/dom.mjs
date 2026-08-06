@@ -219,7 +219,7 @@ export class Node extends EventTarget {
     // and feed MutationObservers, like every other childList mutation path.
     if (changed) notifyMutation(this, 'childList', null, null, null);
   }
-  replaceChildren(...nodes) { this.__kids = []; this.__touch(); for (const n of nodes) this.appendChild(typeof n === 'string' ? this.ownerDocument.createTextNode(n) : n); }
+  replaceChildren(...nodes) { this.__detachKids(); this.__kids = []; this.__touch(); for (const n of nodes) this.appendChild(typeof n === 'string' ? this.ownerDocument.createTextNode(n) : n); }
   // bitmask: 1 DISCONNECTED, 2 PRECEDING, 4 FOLLOWING, 8 CONTAINS, 16 CONTAINED_BY
   compareDocumentPosition(other) {
     if (other === this) return 0;
@@ -268,6 +268,7 @@ export class Node extends EventTarget {
     return s;
   }
   set textContent(value) {
+    this.__detachKids();
     this.__kids = [];
     this.__touch();
     if (value !== '') this.appendChild(this.ownerDocument.createTextNode(String(value)));
@@ -277,6 +278,18 @@ export class Node extends EventTarget {
   // __kids reassignments (innerHTML/textContent/replaceChildren) that bypass
   // insertBefore/removeChild.
   __touch() { const d = this.ownerDocument; if (d) d.__version = (d.__version || 0) + 1; }
+
+  // Clear the outgoing children's parentNode before a wholesale `__kids = []` rewrite
+  // (innerHTML/textContent/replaceChildren) — removeChild does this one at a time, these
+  // paths bypass it. Without it a reference held into the replaced subtree keeps reporting
+  // the (now unrelated) old parent and walks back up into the live tree.
+  // Reads __kids DIRECTLY, never __children(): an un-inflated buffer-backed child has no
+  // node object yet, so nothing can be holding it — inflating a whole child list just to
+  // null out parent pointers would put an allocation on the React container-clear path.
+  __detachKids() {
+    const kids = this.__kids;
+    if (kids) for (let i = 0; i < kids.length; i++) kids[i].parentNode = null;
+  }
 
   // Element/Document/Fragment nodeValue is null per spec (CharacterData overrides).
   get nodeValue() { return null; }
@@ -706,7 +719,7 @@ export class Element extends Node {
   before(...nodes) { const p = this.parentNode; if (!p) return; for (const n of nodes) p.insertBefore(toNode(this.ownerDocument, n), this); }
   after(...nodes) { const p = this.parentNode; if (!p) return; const ref = viableNextSibling(this, nodes); for (const n of nodes) p.insertBefore(toNode(this.ownerDocument, n), ref); }
   replaceWith(...nodes) { const p = this.parentNode; if (!p) return; const ref = viableNextSibling(this, nodes); for (const n of nodes) if (n !== this) p.insertBefore(toNode(this.ownerDocument, n), ref); this.remove(); }
-  replaceChildren(...nodes) { this.__kids = []; this.__touch(); for (const n of nodes) this.appendChild(toNode(this.ownerDocument, n)); }
+  replaceChildren(...nodes) { this.__detachKids(); this.__kids = []; this.__touch(); for (const n of nodes) this.appendChild(toNode(this.ownerDocument, n)); }
 
   // ---- queries ----
   matches(sel) { return matchesSelector(this, sel); }
@@ -728,6 +741,7 @@ export class Element extends Node {
   get innerHTML() { return serializeInner(this); }
   set innerHTML(html) {
     const frag = getParser().parseFragment(String(html), this.__ns ? `${this.__ns} ${this.localName}` : this.localName);
+    this.__detachKids();
     this.__kids = [];
     this.__touch();
     for (const rawChild of frag.children) {
@@ -1050,6 +1064,7 @@ export class ShadowRoot extends DocumentFragment {
   get innerHTML() { return serializeInner(this); }
   set innerHTML(html) {
     const frag = getParser().parseFragment(String(html), ''); // empty context → body
+    this.__detachKids();
     this.__kids = [];
     this.__touch();
     for (const rawChild of frag.children) {

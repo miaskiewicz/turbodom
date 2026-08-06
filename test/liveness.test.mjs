@@ -175,3 +175,44 @@ test('Element.attributes is a live NamedNodeMap (React 19 releaseSingletonInstan
   assert.equal(el.getAttribute('w'), '8');
   assert.equal(String(el.attributes), '[object NamedNodeMap]');
 });
+
+// A subtree replaced wholesale (innerHTML / textContent / replaceChildren) must leave its
+// old children DETACHED — a reference held into the replaced subtree that walks parentNode
+// upward has to terminate, not climb back into the live tree. jsdom is the oracle.
+// (rtdom parity: crates/turbo-dom/src/rtdom/tree.rs `orphan_children`.)
+test('replaced children are detached (parentNode cleared), not left pointing at the old parent', () => {
+  const html = '<!doctype html><body><div id="a"><span id="s"><b id="deep">x</b></span></div></body>';
+
+  for (const [name, replace] of [
+    ['innerHTML', (el) => { el.innerHTML = '<em>new</em>'; }],
+    ['textContent', (el) => { el.textContent = 'new'; }],
+    ['textContent=""', (el) => { el.textContent = ''; }],
+    ['replaceChildren', (el) => { el.replaceChildren(); }],
+  ]) {
+    const doc = createEnvironment(html).document;
+    const jdoc = new JSDOM(html).window.document;
+    for (const d of [doc, jdoc]) {
+      const a = d.getElementById('a');
+      const s = d.getElementById('s');
+      const deep = d.getElementById('deep');
+      a.querySelectorAll('*'); // force inflation of the subtree before it is replaced
+      replace(a);
+      assert.equal(s.parentNode, null, `${name}: orphan reports no parent (${d === doc ? 'turbo' : 'jsdom'})`);
+      assert.equal(Array.from(a.childNodes).includes(s), false, `${name}: not a child anymore`);
+      // the detached subtree itself is intact — only the top link is cut
+      assert.equal(deep.parentNode, s, `${name}: inner structure survives`);
+      assert.equal(s.contains(deep), true);
+    }
+  }
+});
+
+test('replaceChildren detaches the outgoing children on a document fragment too', () => {
+  const doc = createEnvironment('<!doctype html><body></body>').document;
+  const frag = doc.createDocumentFragment();
+  const kid = doc.createElement('p');
+  frag.appendChild(kid);
+  assert.equal(kid.parentNode, frag);
+  frag.replaceChildren(doc.createElement('b'));
+  assert.equal(kid.parentNode, null);
+  assert.equal(frag.childNodes.length, 1);
+});

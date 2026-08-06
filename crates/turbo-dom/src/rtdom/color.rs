@@ -386,14 +386,8 @@ fn hsl_to_rgb(v: &str) -> Option<String> {
     }
     let mut h = parse_float_js(parts[0])?;
     // JS: parseFloat(parts[1]) / 100 — if NaN, the / 100 stays NaN, caught below.
-    let s = match parse_float_js(parts[1]) {
-        Some(x) => x / 100.0,
-        None => return None,
-    };
-    let l = match parse_float_js(parts[2]) {
-        Some(x) => x / 100.0,
-        None => return None,
-    };
+    let s = parse_float_js(parts[1])? / 100.0;
+    let l = parse_float_js(parts[2])? / 100.0;
     let a = parts.get(3).and_then(|p| parse_float_js(p));
 
     h = (((h % 360.0) + 360.0) % 360.0) / 360.0;

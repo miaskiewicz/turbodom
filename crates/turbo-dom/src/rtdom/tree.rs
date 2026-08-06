@@ -835,6 +835,35 @@ impl Tree {
         }
     }
 
+    /// Detach every current child of `h`, for the callers that overwrite the whole child
+    /// list at once (`textContent` / `innerHTML` setters). Each prior child's `parent_ov`
+    /// becomes `None`, so a consumer still holding a handle into the replaced subtree sees
+    /// a detached node instead of a stale parent pointer that climbs back into the live
+    /// tree. `remove_child` already does this on the one-at-a-time path.
+    ///
+    /// Allocation-free on the two shapes that matter: an existing overlay is moved out
+    /// (`SmallVec`, inline up to 8), and an untouched buffer-backed node walks the `SoA`
+    /// sibling chain directly rather than materializing `children()`.
+    fn orphan_children(&mut self, h: Handle) {
+        if let Some(list) = self.children_ov.get_mut(h) {
+            // Leaves an empty overlay entry behind — every caller overwrites it immediately.
+            let prior = std::mem::take(list);
+            for &c in &prior {
+                self.parent_ov.insert(c, None);
+            }
+            return;
+        }
+        if self.is_new(h) {
+            return;
+        }
+        let mut c = self.buf.first_child[h.idx()];
+        while c >= 0 {
+            let next = self.buf.next_sib[c as usize];
+            self.parent_ov.insert(Handle(c as u32), None);
+            c = next;
+        }
+    }
+
     pub fn append_child(&mut self, parent: Handle, child: Handle) {
         self.detach(child);
         self.ensure_children(parent).push(child);
@@ -873,6 +902,14 @@ impl Tree {
             self.bump();
             self.record_character_data(h, old);
         } else {
+            // `removed` (the prior child list) is needed ONLY for a mutation record;
+            // the overlay overwrite below ignores it. So snapshot it solely when
+            // recording, and avoid cloning `added` on the no-observer path. Snapshot
+            // BEFORE orphaning — `orphan_children` moves the child list out.
+            let removed = if self.is_recording() { self.children(h) } else { Vec::new() };
+            // The prior children leave the tree: clear their parent pointers so none of
+            // them keeps reporting `parent() == h` after the overwrite below.
+            self.orphan_children(h);
             // replace children with a single text node — but per the DOM spec, the EMPTY string
             // produces NO child node (the element ends up empty). React's createRoot clears the
             // container via `textContent = ''` and relies on it leaving zero children.
@@ -883,11 +920,7 @@ impl Tree {
                 self.parent_ov.insert(t, Some(h));
                 vec![t]
             };
-            // `removed` (the prior child list) is needed ONLY for a mutation record;
-            // the overlay overwrite below ignores it. So snapshot it solely when
-            // recording, and avoid cloning `added` on the no-observer path.
             if self.is_recording() {
-                let removed = self.children(h);
                 self.children_ov.insert(h, added.clone().into());
                 self.bump();
                 self.record_child_list_batch(h, added, removed);
@@ -1005,6 +1038,9 @@ impl Tree {
     pub fn set_inner_html(&mut self, h: Handle, html: &str) {
         let ctx = self.local_name(h).unwrap_or("body").to_string();
         let frag = core::parse_html_fragment_context(html, &ctx);
+        // The prior children are replaced wholesale — detach them first so a retained
+        // handle into the old subtree reports no parent rather than pointing back at `h`.
+        self.orphan_children(h);
         let mut kids = Vec::with_capacity(frag.children.len());
         for c in &frag.children {
             kids.push(self.import_node(c));
@@ -1645,6 +1681,56 @@ mod tests {
         assert_eq!(kids.len(), 1);
         assert_eq!(tree.node_type(kids[0]), NodeType::Text);
         assert_eq!(tree.parent(kids[0]), Some(div));
+    }
+
+    // A subtree replaced wholesale must leave its old children DETACHED: a consumer that
+    // still holds a handle into the replaced subtree and walks `parent()` upward has to
+    // terminate at `None`, not climb back into the live tree (issue #4).
+    #[test]
+    fn set_text_content_orphans_the_replaced_children() {
+        let mut tree = t("<div><span>old</span></div>");
+        let div = tree.handles().find(|&h| tree.local_name(h) == Some("div")).unwrap();
+        let span = tree.handles().find(|&h| tree.local_name(h) == Some("span")).unwrap();
+        let inner = tree.children(span)[0];
+        assert_eq!(tree.parent(span), Some(div));
+        // buffer-backed node with no child overlay yet -> the `SoA` sibling-chain walk
+        tree.set_text_content(div, "new");
+        assert_eq!(tree.parent(span), None, "replaced child is detached");
+        assert!(!tree.children(div).contains(&span));
+        // the detached subtree itself stays intact — only its top link is cut
+        assert_eq!(tree.parent(inner), Some(span));
+        // and the empty-string (React container clear) path orphans too
+        let mut tree = t("<div><span>old</span></div>");
+        let div = tree.handles().find(|&h| tree.local_name(h) == Some("div")).unwrap();
+        let span = tree.handles().find(|&h| tree.local_name(h) == Some("span")).unwrap();
+        tree.set_text_content(div, "");
+        assert!(tree.children(div).is_empty());
+        assert_eq!(tree.parent(span), None);
+    }
+
+    #[test]
+    fn set_inner_html_orphans_the_replaced_children() {
+        let mut tree = t("<div></div>");
+        let div = tree.handles().find(|&h| tree.local_name(h) == Some("div")).unwrap();
+        // append first so `div` has a child OVERLAY — the other `orphan_children` branch
+        let kid = tree.create_element("p");
+        tree.append_child(div, kid);
+        assert_eq!(tree.parent(kid), Some(div));
+        tree.set_inner_html(div, "<b>x</b>");
+        assert_eq!(tree.parent(kid), None, "replaced child is detached");
+        assert_eq!(tree.children(div).len(), 1);
+        assert_eq!(tree.parent(tree.children(div)[0]), Some(div));
+    }
+
+    #[test]
+    fn orphan_children_skips_a_created_node_with_no_child_overlay() {
+        // Defensive branch: a CREATED node without a child overlay (a text node — only
+        // created elements get one) has no `SoA` slot, so the chain walk must be skipped
+        // rather than indexing the buffer out of range.
+        let mut tree = t("<div></div>");
+        let txt = tree.create_text_node("x");
+        tree.set_inner_html(txt, "<b>y</b>");
+        assert_eq!(tree.children(txt).len(), 1);
     }
 
     #[test]

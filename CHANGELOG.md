@@ -5,6 +5,38 @@ environment for vitest/jest. Format based on [Keep a Changelog](https://keepacha
 Early versions were released as lightweight tags / version-stamped commits (no per-release notes
 at the time); this file reconstructs them from history.
 
+## [0.5.0] — rtdom internal consistency (stale parent pointers, unset event target)
+
+Fixes the two correctness issues filed in
+[#4](https://github.com/miaskiewicz/turbo-dom/issues/4). Both are internal-consistency
+bugs, not regressions — neither is reachable through `query_selector*` or serialize.
+
+### Fixed
+- **Replaced subtrees are now detached in both runtimes.** `textContent` / `innerHTML` /
+  `replaceChildren` overwrite a node's whole child list; they never cleared the OUTGOING
+  children's parent pointer, so a retained reference into the replaced subtree kept
+  reporting the old parent and walking `parent()`/`parentNode` upward climbed back into the
+  live tree. Both runtimes now cut that link (rtdom `Tree::orphan_children`, JS
+  `Node.__detachKids`) exactly as `remove_child`/`removeChild` already did on the
+  one-at-a-time path. The detached subtree itself stays intact — only its top link is cut.
+  No hot-path cost: rtdom moves the existing child overlay out (`SmallVec`, no `Vec`) or
+  walks the `SoA` sibling chain in place, and the JS side reads `__kids` directly, so an
+  un-inflated buffer-backed child list is never materialized just to null parent pointers.
+
+### Changed (BREAKING — `turbo-dom` crate only)
+- **`Event::target` / `Event::current_target` are `Option<Handle>`** (were `Handle`). A
+  fresh `Event` defaulted them to `Handle(0)` — the DOCUMENT ROOT — so a pre-dispatch read
+  silently claimed the event targeted the document. `dispatch_event` always set `target`
+  before any listener ran, so no dispatch behavior changes; this closes the latent footgun
+  by modeling "unset" as `None`, matching the sentinel-free parent-pointer modeling adopted
+  in 0.4.0. In-process Rust consumers that read `event.target` need `event.target.unwrap()`
+  / a `Some(_)` match. The npm package and the napi/wasm parser API are unaffected.
+
+### Added
+- Consumer-contract coverage (`crates/turbo-dom/tests/consumer_contract.rs`) for the
+  `Dom`/`Event` dispatch surface and for subtree-replacement detachment, so both shapes now
+  fail CI before a break can reach turbo-test / turbo-surf.
+
 ## [0.4.0] — selector engine rewrite + Rust-native DOM runtime consolidation
 
 Touches BOTH runtimes at parity. The napi/wasm parser API is unchanged; `src/runtime/*.mjs`

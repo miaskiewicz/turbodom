@@ -1,6 +1,6 @@
 {
   "name": "@miaskiewicz/turbo-dom",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "Faster, more spec-correct DOM for test runners — native html5ever (Rust/WASM) parser + lazy copy-on-write DOM. A drop-in-style alternative to jsdom/happy-dom for vitest & jest.",
   "license": "MIT",
   "main": "index.js",
