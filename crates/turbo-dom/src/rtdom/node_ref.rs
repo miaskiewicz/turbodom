@@ -344,7 +344,7 @@ mod tests {
         let span = card.first_element_child().expect("span");
         let text = span.first_child().expect("text node");
         assert_eq!(text.local_name(), None);
-        assert!(text.node_type() != NodeType::Element);
+        assert_ne!(text.node_type(), NodeType::Element);
     }
 
     #[test]
