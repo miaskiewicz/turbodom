@@ -25,8 +25,14 @@ pub struct Event {
     pub event_type: String,
     pub bubbles: bool,
     pub cancelable: bool,
-    pub target: Handle,
-    pub current_target: Handle,
+    /// The dispatch target — `None` until `dispatch_event` sets it. Modeled as an
+    /// `Option` (not a sentinel handle) because `Handle(0)` is the document root: a
+    /// pre-dispatch read of a sentinel would silently claim the event targets the
+    /// document. Same "no impossible states" rule as the `parent_ov` pointer.
+    pub target: Option<Handle>,
+    /// The node whose listeners are running right now — `Some` only during dispatch,
+    /// cleared back to `None` when dispatch ends.
+    pub current_target: Option<Handle>,
     pub phase: Phase,
     default_prevented: bool,
     propagation_stopped: bool,
@@ -40,8 +46,8 @@ impl Event {
             event_type: event_type.to_string(),
             bubbles,
             cancelable,
-            target: Handle(0),
-            current_target: Handle(0),
+            target: None,
+            current_target: None,
             phase: Phase::None,
             default_prevented: false,
             propagation_stopped: false,
@@ -138,7 +144,7 @@ impl Dom {
             path.push(p);
             cur = self.tree.parent(p);
         }
-        event.target = target;
+        event.target = Some(target);
 
         // Listener-less fast path: skip all phase work (matches JS hasListener gate).
         if !self.path_has_listener(&path, &event.event_type) {
@@ -164,7 +170,7 @@ impl Dom {
                 if event.propagation_stopped && phase != Phase::AtTarget {
                     break 'outer;
                 }
-                event.current_target = node;
+                event.current_target = Some(node);
                 event.phase = phase;
                 if let Some(list) = registry.get_mut(&node) {
                     // snapshot ids to invoke (slice copy semantics)
@@ -216,7 +222,7 @@ impl Dom {
         self.listeners = registry;
 
         event.phase = Phase::None;
-        event.current_target = Handle(0);
+        event.current_target = None;
         !event.default_prevented
     }
 }
@@ -426,7 +432,7 @@ mod tests {
         let mut dom = Dom::parse("<div><button>x</button></div>");
         let button = find(&dom, "button");
         let div = find(&dom, "div");
-        let seen = Rc::new(RefCell::new(Vec::<(Handle, Phase)>::new()));
+        let seen = Rc::new(RefCell::new(Vec::<(Option<Handle>, Phase)>::new()));
         let s1 = seen.clone();
         // capture on ancestor: observes current_target == div, phase == Capturing,
         // then stops propagation -> target listener must NOT run, break 'outer (~206).
@@ -439,10 +445,34 @@ mod tests {
         dom.add_event_listener(button, "click", false, false, Box::new(move |_, _| *th.borrow_mut() = true));
         let mut ev = Event::new("click", true, true);
         dom.dispatch_event(button, &mut ev);
-        assert_eq!(*seen.borrow(), vec![(div, Phase::Capturing)]);
+        assert_eq!(*seen.borrow(), vec![(Some(div), Phase::Capturing)]);
         assert!(!*target_hit.borrow());
         // after dispatch, phase resets to None and current_target cleared.
         assert_eq!(ev.phase, Phase::None);
-        assert_eq!(ev.current_target, Handle(0));
+        assert_eq!(ev.current_target, None);
+    }
+
+    // A fresh Event has NO target — reading it before dispatch must not report the
+    // document root (`Handle(0)`), which is what a sentinel handle would do (issue #4).
+    #[test]
+    fn target_is_none_until_dispatch() {
+        let mut dom = Dom::parse("<div><button>x</button></div>");
+        let button = find(&dom, "button");
+        let mut ev = Event::new("click", true, true);
+        assert_eq!(ev.target, None, "unset target is None, not the document root");
+        assert_eq!(ev.current_target, None);
+        // the listener-less fast path still sets target...
+        dom.dispatch_event(button, &mut ev);
+        assert_eq!(ev.target, Some(button));
+        assert_eq!(ev.current_target, None, "cleared outside dispatch");
+        // ...and so does the full dispatch path, as seen from inside a handler.
+        let seen = Rc::new(RefCell::new(None));
+        let s1 = seen.clone();
+        dom.add_event_listener(button, "click", false, false, Box::new(move |_, e| {
+            *s1.borrow_mut() = e.target;
+        }));
+        let mut ev2 = Event::new("click", true, true);
+        dom.dispatch_event(button, &mut ev2);
+        assert_eq!(*seen.borrow(), Some(button));
     }
 }

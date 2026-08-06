@@ -24,6 +24,7 @@ use turbo_dom::rtdom::cascade::{computed_style, get_property_value};
 use turbo_dom::rtdom::node_ref::DocumentExt;
 use turbo_dom::rtdom::serialize::{serialize_inner, serialize_outer};
 use turbo_dom::rtdom::tree::{Handle, Namespace, Tree};
+use turbo_dom::rtdom::{Dom, Event};
 use turbo_dom::rtdom::NodeRef;
 
 /// Depth-first search for the first text node — exercises `children()` + `node_type_id()`.
@@ -131,4 +132,40 @@ fn serialize_cascade_noderef_documentext_surface() {
     assert_eq!(tree.node(a).handle(), a);
     assert!(tree.query("#a").is_some());
     assert_eq!(tree.query_all(".zzz").len(), 0);
+}
+
+#[test]
+fn event_dispatch_surface_is_present() {
+    // Consumers that drive the DOM from Rust (rather than their own JS event layer) go
+    // through `Dom` + `Event`. `target`/`current_target` are `Option<Handle>`: `None`
+    // before dispatch, `Some(node)` from `dispatch_event` onward. They are NOT a sentinel
+    // handle — `Handle(0)` is the document root, so a sentinel would read as "targets the
+    // document" before dispatch.
+    let mut dom = Dom::parse("<div id=outer><button id=b>x</button></div>");
+    let button = dom.tree.get_element_by_id("b").expect("#b");
+    let mut ev = Event::new("click", true, true);
+    assert_eq!(ev.target, None);
+    assert_eq!(ev.current_target, None);
+    let id = dom.add_event_listener(button, "click", false, false, Box::new(|_, e| e.prevent_default()));
+    let not_prevented = dom.dispatch_event(button, &mut ev);
+    assert_eq!(ev.target, Some(button));
+    assert!(!not_prevented, "dispatch_event returns !defaultPrevented");
+    assert!(ev.default_prevented());
+    dom.remove_event_listener(button, id);
+}
+
+#[test]
+fn subtree_replacement_detaches_the_old_children() {
+    // A handle retained into a replaced subtree must report NO parent — walking `parent()`
+    // upward from it terminates instead of climbing back into the live tree.
+    let mut tree = Tree::parse("<div id=a><span id=s>old</span></div>");
+    let a = tree.query_selector("#a").unwrap();
+    let s = tree.query_selector("#s").unwrap();
+    tree.set_inner_html(a, "<em>new</em>");
+    assert_eq!(tree.parent(s), None);
+    let mut tree = Tree::parse("<div id=a><span id=s>old</span></div>");
+    let a = tree.query_selector("#a").unwrap();
+    let s = tree.query_selector("#s").unwrap();
+    tree.set_text_content(a, "new");
+    assert_eq!(tree.parent(s), None);
 }
